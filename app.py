@@ -56,7 +56,6 @@ class BaseConocimiento:
                 'fuente': nombre_archivo,
                 'metadatos': metadatos
             })
-        
         # Actualizar vectores
         self._actualizar_vectores()
         
