@@ -149,7 +149,7 @@ with st.sidebar:
     # Mostrar fuentes cargadas
     if st.session_state.base_conocimiento.fragmentos:
         st.subheader("Documentos cargados")
-        fuentes = list(set(f['fuente'] for f in st.session_state.base_conocimiento.fragmentos))
+       fuentes = set(f['fuente'] for f in st.session_state.base_conocimiento.fragmentos)
         for f in fuentes:
             st.write(f"- {f}")
 
