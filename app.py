@@ -6,13 +6,19 @@ import pickle
 import tempfile
 from sentence_transformers import SentenceTransformer
 
-# Configuración de la página
-st.set_page_config(page_title="Asistente IA para Asesoría Laboral", layout="wide")
+# OpenAI opcional
+try:
+    import openai
+    openai.api_key = st.secrets.get("OPENAI_API_KEY", None)
+except ImportError:
+    openai = None
 
-# Título principal
+# Configuración de página
+st.set_page_config(page_title="Asistente IA para Asesoría Laboral", layout="wide")
 st.title("Asistente IA para Asesoría Laboral")
 
-# Función para extraer texto de PDFs
+# --- FUNCIONES Y CLASES ---
+
 def extraer_texto_pdf(archivo_pdf):
     texto = ""
     documento = fitz.open(stream=archivo_pdf.read(), filetype="pdf")
@@ -20,219 +26,195 @@ def extraer_texto_pdf(archivo_pdf):
         texto += pagina.get_text()
     return texto
 
-# Función para dividir el texto en fragmentos manejables
 def dividir_en_fragmentos(texto, tamano_max=1000):
     palabras = texto.split()
-    fragmentos = []
-    fragmento_actual = []
-    
+    fragmentos, actual = [], []
+
     for palabra in palabras:
-        fragmento_actual.append(palabra)
-        if len(" ".join(fragmento_actual)) >= tamano_max:
-            fragmentos.append(" ".join(fragmento_actual))
-            fragmento_actual = []
-    
-    if fragmento_actual:
-        fragmentos.append(" ".join(fragmento_actual))
-        
+        actual.append(palabra)
+        if len(" ".join(actual)) >= tamano_max:
+            fragmentos.append(" ".join(actual))
+            actual = []
+
+    if actual:
+        fragmentos.append(" ".join(actual))
     return fragmentos
 
-# Clase para la base de conocimiento
 class BaseConocimiento:
-    def __init__(self):
-        # Cargar modelo de embeddings multilingüe (español incluido)
-        self.modelo = SentenceTransformer('paraphrase-multilingual-mpnet-base-v2')
+    def __init__(self, modelo_path='paraphrase-multilingual-mpnet-base-v2'):
+        self.modelo = SentenceTransformer(modelo_path)
         self.fragmentos = []
         self.vectores = None
-        
+
     def agregar_documento(self, texto, nombre_archivo, metadatos=None):
-        # Dividir el texto
         fragmentos = dividir_en_fragmentos(texto)
-        
-        # Guardar fragmentos con metadatos
+        nuevos_textos = []
+
         for fragmento in fragmentos:
             self.fragmentos.append({
                 'texto': fragmento,
                 'fuente': nombre_archivo,
                 'metadatos': metadatos
             })
-        
-        # Actualizar vectores
-        self._actualizar_vectores()
-        
-    def _actualizar_vectores(self):
-        # Crear vectores para todos los fragmentos
-        if self.fragmentos:
-            textos = [f['texto'] for f in self.fragmentos]
-            self.vectores = self.modelo.encode(textos)
-        
+            nuevos_textos.append(fragmento)
+
+        self._actualizar_vectores(nuevos_textos)
+
+    def _actualizar_vectores(self, nuevos_textos=None):
+        if nuevos_textos:
+            nuevos_vectores = self.modelo.encode(nuevos_textos)
+            if self.vectores is None:
+                self.vectores = nuevos_vectores
+            else:
+                self.vectores = np.vstack([self.vectores, nuevos_vectores])
+
     def buscar(self, consulta, k=3):
         if not self.fragmentos or self.vectores is None:
             return []
-            
-        # Vectorizar la consulta
+
         vector_consulta = self.modelo.encode(consulta)
-        
-        # Calcular similitud con todos los fragmentos
         similitudes = np.dot(self.vectores, vector_consulta) / (
             np.linalg.norm(self.vectores, axis=1) * np.linalg.norm(vector_consulta)
         )
-        
-        # Encontrar los k más similares
-        indices_top = np.argsort(-similitudes)[:k]
-        
-        # Devolver resultados
-        resultados = []
-        for idx in indices_top:
-            resultados.append({
-                'fragmento': self.fragmentos[idx],
-                'similitud': similitudes[idx]
-            })
-        
-        return resultados
 
-# Inicializar la sesión si es necesario
+        indices_top = np.argsort(-similitudes)[:k]
+
+        return [{
+            'fragmento': self.fragmentos[i],
+            'similitud': similitudes[i]
+        } for i in indices_top]
+
+    def exportar(self):
+        return {
+            "fragmentos": self.fragmentos,
+            "vectores": self.vectores.tolist() if self.vectores is not None else None
+        }
+
+    def cargar(self, datos):
+        self.fragmentos = datos.get("fragmentos", [])
+        vectores = datos.get("vectores")
+        if vectores is not None:
+            self.vectores = np.array(vectores)
+
+def generar_respuesta_llm(fragmentos, consulta):
+    if not openai or not openai.api_key:
+        return "⚠️ No se ha configurado OpenAI correctamente."
+
+    contenido = "\n\n".join(fragmentos)
+    prompt = f"""
+    Contenido legal relevante:
+
+    {contenido}
+
+    Pregunta:
+    {consulta}
+
+    Responde con claridad y precisión.
+    """
+
+    try:
+        respuesta = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3
+        )
+        return respuesta.choices[0].message.content.strip()
+    except Exception as e:
+        return f"Error al generar respuesta: {e}"
+
+# --- INICIALIZACIÓN DE SESIÓN ---
 if 'base_conocimiento' not in st.session_state:
     st.session_state.base_conocimiento = BaseConocimiento()
 
-# Barra lateral para cargar documentos
+# --- BARRA LATERAL ---
 with st.sidebar:
-    st.header("Cargar Documentos")
-    
-    # Subir archivo
-    uploaded_file = st.file_uploader("Selecciona un archivo PDF", type="pdf")
-    
+    st.header("📄 Cargar Documentos")
+    uploaded_file = st.file_uploader("Selecciona un PDF", type="pdf")
+
     if uploaded_file is not None:
-        # Metadatos del documento
         titulo = st.text_input("Título del documento (opcional)")
         tema = st.text_input("Tema o categoría (opcional)")
-        
-        # Botón para procesar
+
         if st.button("Procesar Documento"):
             with st.spinner("Procesando documento..."):
-                # Extraer texto
-                texto = extraer_texto_pdf(uploaded_file)
-                
-                # Agregar a la base de conocimiento
-                st.session_state.base_conocimiento.agregar_documento(
-                    texto, 
-                    uploaded_file.name,
-                    {'titulo': titulo, 'tema': tema}
-                )
-                
-                st.success(f"Documento '{uploaded_file.name}' procesado correctamente")
-                st.text(f"Fragmentos: {len(st.session_state.base_conocimiento.fragmentos)}")
+                try:
+                    texto = extraer_texto_pdf(uploaded_file)
+                    st.session_state.base_conocimiento.agregar_documento(
+                        texto, uploaded_file.name, {'titulo': titulo, 'tema': tema}
+                    )
+                    st.success(f"Documento '{uploaded_file.name}' cargado.")
+                except Exception as e:
+                    st.error(f"Error al procesar el documento: {e}")
 
-    # Mostrar documentos cargados
+    # Mostrar fuentes cargadas
     if st.session_state.base_conocimiento.fragmentos:
         st.subheader("Documentos cargados")
-        fuentes = set(f['fragmento']['fuente'] for f in st.session_state.base_conocimiento.fragmentos)
-        for fuente in fuentes:
-            st.write(f"- {fuente}")
+        fuentes = list(set(f['fuente'] for f in st.session_state.base_conocimiento.fragmentos))
+        for f in fuentes:
+            st.write(f"- {f}")
 
-# Área principal para consultas
-st.header("Consulta sobre Asesoría Laboral")
+# --- ÁREA PRINCIPAL ---
+st.header("💬 Consulta sobre Asesoría Laboral")
+consulta_usuario = st.text_area("Escribe tu pregunta:", height=100)
 
-# Campo de consulta
-consulta_usuario = st.text_area("Escribe tu consulta sobre temas laborales", height=100)
-
-# Botón para consultar
 if st.button("Consultar"):
     if not consulta_usuario:
-        st.warning("Por favor, escribe una consulta")
+        st.warning("Escribe una consulta.")
     elif not st.session_state.base_conocimiento.fragmentos:
-        st.warning("No hay documentos cargados en la base de conocimiento")
+        st.warning("Primero debes cargar documentos.")
     else:
-        with st.spinner("Buscando respuesta..."):
-            # Buscar información relevante
+        with st.spinner("Buscando información..."):
             resultados = st.session_state.base_conocimiento.buscar(consulta_usuario)
-            
             if not resultados:
-                st.error("No se encontró información relevante")
+                st.error("No se encontró información relevante.")
             else:
-                # Mostrar respuesta
-                st.subheader("Respuesta:")
-                
-                # Construir respuesta basada en los fragmentos recuperados
-                respuesta = "Basado en la información disponible:\n\n"
-                
+                st.subheader("📌 Fragmentos relevantes")
                 for i, res in enumerate(resultados, 1):
-                    fragmento = res['fragmento']['texto']
-                    fuente = res['fragmento']['fuente']
-                    similitud = res['similitud']
-                    
-                    # Añadir a la respuesta general (versión simple)
-                    respuesta += f"{fragmento}\n\n"
-                
+                    st.markdown(f"**Fragmento {i}** (Similitud: {res['similitud']:.2f})")
+                    st.text(res['fragmento']['texto'][:500] + "...")
+
+                st.subheader("🧠 Respuesta generada por IA")
+                textos = [res['fragmento']['texto'] for res in resultados]
+                respuesta = generar_respuesta_llm(textos, consulta_usuario)
                 st.write(respuesta)
-                
-                # Mostrar fuentes utilizadas
-                st.subheader("Fuentes consultadas:")
-                for res in resultados:
-                    fuente = res['fragmento']['fuente']
-                    metadata = res['fragmento']['metadatos']
-                    titulo = metadata.get('titulo', 'Sin título') if metadata else 'Sin título'
-                    
-                    st.write(f"- {fuente} - {titulo}")
-                
-                # Expandible con fragmentos específicos
-                with st.expander("Ver fragmentos específicos utilizados"):
-                    for i, res in enumerate(resultados, 1):
-                        st.markdown(f"**Fragmento {i}** (Similitud: {res['similitud']:.2f})")
-                        st.text(res['fragmento']['texto'][:300] + "...")
 
-# Sección para guardar/cargar la base de conocimiento
-st.header("Gestionar Base de Conocimiento")
-
+# --- GESTIÓN DE BASE ---
+st.header("💾 Gestionar Base de Conocimiento")
 col1, col2 = st.columns(2)
 
 with col1:
-    if st.button("Guardar Base de Conocimiento"):
+    if st.button("Guardar Base"):
         if not st.session_state.base_conocimiento.fragmentos:
-            st.warning("No hay datos para guardar")
+            st.warning("No hay datos para guardar.")
         else:
-            # Crear archivo temporal
+            datos = st.session_state.base_conocimiento.exportar()
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pkl') as temp_file:
-                pickle.dump(st.session_state.base_conocimiento, temp_file)
+                pickle.dump(datos, temp_file)
                 temp_path = temp_file.name
-            
-            # Ofrecer descarga
+
             with open(temp_path, 'rb') as f:
-                st.download_button(
-                    label="Descargar Base de Conocimiento",
-                    data=f,
-                    file_name="base_conocimiento_laboral.pkl",
-                    mime="application/octet-stream"
-                )
-            
-            # Eliminar archivo temporal
+                st.download_button("Descargar Base", data=f, file_name="base_laboral.pkl")
             os.unlink(temp_path)
 
 with col2:
-    uploaded_base = st.file_uploader("Cargar Base de Conocimiento Guardada", type="pkl")
-    if uploaded_base is not None:
-        if st.button("Cargar Base"):
-            try:
-                st.session_state.base_conocimiento = pickle.load(uploaded_base)
-                st.success("Base de conocimiento cargada correctamente")
-            except Exception as e:
-                st.error(f"Error al cargar la base: {e}")
+    base_file = st.file_uploader("Cargar Base Guardada", type="pkl")
+    if base_file and st.button("Cargar Base"):
+        try:
+            datos = pickle.load(base_file)
+            bc = BaseConocimiento()
+            bc.cargar(datos)
+            st.session_state.base_conocimiento = bc
+            st.success("Base cargada correctamente.")
+        except Exception as e:
+            st.error(f"Error al cargar: {e}")
 
-# Información de uso
-with st.expander("Cómo usar este asistente"):
+# --- AYUDA ---
+with st.expander("ℹ️ Cómo usar este asistente"):
     st.markdown("""
-    **Instrucciones de uso:**
-    
-    1. **Cargar documentos**: Usa el panel lateral para subir documentos PDF relacionados con asesoría laboral.
-    2. **Hacer consultas**: Escribe tu pregunta en el área de consulta y presiona "Consultar".
-    3. **Gestionar la base**: Puedes guardar tu base de conocimiento para usarla después.
-    
-    **Recomendaciones:**
-    - Carga documentos relevantes como leyes laborales, reglamentos, casos prácticos, etc.
-    - Sé específico en tus consultas para obtener mejores resultados.
-    - Esta es una versión básica que recupera información pero no genera respuestas elaboradas.
-    """)
+    **Instrucciones:**
+    1. Sube documentos PDF laborales.
+    2. Haz una consulta en lenguaje natural.
+    3. El asistente te mostrará fragmentos relevantes y una respuesta automática.
 
-# Pie de página
-st.markdown("---")
-st.caption("Asistente IA para Asesorías Laborales - Versión 1.0")
+    **Requiere clave de OpenAI para usar GPT-3.5.**
+    """)
