@@ -84,7 +84,7 @@ class BaseConocimiento:
         resultados = []
         for idx in indices_top:
             resultados.append({
-                'fragmento': self.fragmentos[idx],
+                'fragmento': self.fragmentos[idx]['texto'],  # Acceso al texto dentro de cada fragmento
                 'similitud': similitudes[idx]
             })
         
